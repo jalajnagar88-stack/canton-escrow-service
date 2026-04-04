@@ -1,0 +1,19 @@
+sdk-version: 3.1.0
+name: canton-escrow-service
+version: 0.1.0
+source: daml
+dependencies:
+  - daml-prim
+  - daml-stdlib
+  - daml-script
+parties:
+  - Alice
+  - Bob
+  - EscrowAgent
+  - Arbitrator
+exposed-modules:
+  - DA.Time
+  - Main
+  - Escrow
+build-options:
+  - --target=2.1
