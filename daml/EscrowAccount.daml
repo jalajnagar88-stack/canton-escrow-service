@@ -1,0 +1,202 @@
+-- |
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+--
+
+module EscrowAccount where
+
+-- This module assumes the existence of an `EscrowAgreement` template,
+-- which captures the initial terms agreed upon by all parties.
+-- A typical flow would be:
+-- 1. `EscrowAgreement` is created.
+-- 2. A choice on `EscrowAgreement` is exercised to fund the escrow,
+--    which creates this `EscrowAccount` contract.
+import EscrowAgreement (EscrowAgreement)
+
+-- | Receipt for a successfully completed escrow transaction where funds were
+-- | released to the seller. This is a terminal contract.
+template PaymentReceipt
+  with
+    buyer: Party
+    seller: Party
+    agent: Party
+    amount: Decimal
+    currency: Text
+    agreementCid: ContractId EscrowAgreement
+    resolutionNotes: Optional Text -- Populated if the payment was the result of a dispute resolution.
+  where
+    signatory agent
+    observer buyer, seller
+
+-- | Receipt for a refunded escrow transaction where funds were returned
+-- | to the buyer. This is a terminal contract.
+template RefundReceipt
+  with
+    buyer: Party
+    seller: Party
+    agent: Party
+    amount: Decimal
+    currency: Text
+    agreementCid: ContractId EscrowAgreement
+    resolutionNotes: Optional Text -- Populated if the refund was the result of a dispute resolution.
+  where
+    signatory agent
+    observer buyer, seller
+
+-- | Represents an explicit confirmation from the buyer that the goods/services
+-- | have been delivered. The agent can use this contract as authorization to
+-- | release the funds from the escrow account.
+template DeliveryConfirmation
+  with
+    buyer: Party
+    seller: Party
+    agent: Party
+    accountCid: ContractId EscrowAccount
+  where
+    signatory buyer
+    observer agent, seller
+
+-- | Represents explicit authorization from the seller to refund the buyer.
+-- | This is used for non-disputed refunds. The agent can use this contract
+-- | as authorization to process the refund.
+template RefundAuthorization
+  with
+    buyer: Party
+    seller: Party
+    agent: Party
+    accountCid: ContractId EscrowAccount
+  where
+    signatory seller
+    observer agent, buyer
+
+-- | Represents a funded escrow account. This is the primary active state
+-- | where the agent holds the buyer's funds, awaiting confirmation of delivery,
+-- | a refund request, or a dispute.
+template EscrowAccount
+  with
+    buyer: Party
+    seller: Party
+    agent: Party
+    amount: Decimal
+    currency: Text
+    agreementCid: ContractId EscrowAgreement
+  where
+    signatory agent
+    observer buyer, seller
+
+    ensure amount > 0.0
+
+    key (agent, agreementCid) : (Party, ContractId EscrowAgreement)
+    maintainer key._1
+
+    -- | The buyer confirms they have received the goods/services as per the agreement.
+    -- | This creates a `DeliveryConfirmation` contract, which serves as a durable,
+    -- | on-ledger instruction for the agent to release the funds.
+    choice BuyerConfirmsDelivery : ContractId DeliveryConfirmation
+      controller buyer
+      do
+        create DeliveryConfirmation with
+          buyer
+          seller
+          agent
+          accountCid = self
+
+    -- | The seller agrees to refund the buyer. This might occur if the seller
+    -- | cannot fulfill the order. This creates a `RefundAuthorization` contract
+    -- | for the agent to process the refund.
+    choice SellerAuthorizesRefund : ContractId RefundAuthorization
+      controller seller
+      do
+        create RefundAuthorization with
+          buyer
+          seller
+          agent
+          accountCid = self
+
+    -- | The agent acts on the buyer's confirmation to release funds to the seller.
+    -- | This choice consumes the `DeliveryConfirmation` and the `EscrowAccount`,
+    -- | and produces a final `PaymentReceipt`.
+    choice AgentReleasesFunds : ContractId PaymentReceipt
+      with
+        confirmationCid: ContractId DeliveryConfirmation
+      controller agent
+      do
+        confirmation <- fetch confirmationCid
+        assertMsg "The provided delivery confirmation is not for this escrow account."
+          (confirmation.accountCid == self)
+
+        archive confirmationCid
+        create PaymentReceipt with resolutionNotes = None, ..
+
+    -- | The agent acts on the seller's authorization to refund the buyer.
+    -- | This choice consumes the `RefundAuthorization` and `EscrowAccount`,
+    -- | and produces a final `RefundReceipt`.
+    choice AgentProcessesRefund : ContractId RefundReceipt
+      with
+        authorizationCid: ContractId RefundAuthorization
+      controller agent
+      do
+        authorization <- fetch authorizationCid
+        assertMsg "The provided refund authorization is not for this escrow account."
+          (authorization.accountCid == self)
+
+        archive authorizationCid
+        create RefundReceipt with resolutionNotes = None, ..
+
+    -- | Either the buyer or seller can raise a dispute, escalating the issue to the
+    -- | agent for manual resolution. This transitions the state by archiving this
+    -- | account and creating a `DisputedEscrowAccount`.
+    choice RaiseDispute : ContractId DisputedEscrowAccount
+      with
+        disputer: Party
+        reason: Text
+      controller disputer
+      do
+        assertMsg "Only the buyer or seller can raise a dispute."
+          (disputer == buyer || disputer == seller)
+
+        create DisputedEscrowAccount with
+          disputer
+          reason
+          ..
+
+-- | Represents an escrow account that is under dispute. In this state, fund
+-- | movement is frozen until the agent investigates and makes a ruling.
+template DisputedEscrowAccount
+  with
+    buyer: Party
+    seller: Party
+    agent: Party
+    amount: Decimal
+    currency: Text
+    agreementCid: ContractId EscrowAgreement
+    disputer: Party
+    reason: Text
+  where
+    signatory agent
+    observer buyer, seller
+
+    key (agent, agreementCid) : (Party, ContractId EscrowAgreement)
+    maintainer key._1
+
+    -- | The agent resolves the dispute in favor of the seller, releasing the funds.
+    -- | This archives the disputed account and creates a final `PaymentReceipt`.
+    choice ResolveDisputeAndRelease : ContractId PaymentReceipt
+      with
+        resolutionNotes: Text
+      controller agent
+      do
+        create PaymentReceipt with
+          resolutionNotes = Some resolutionNotes
+          ..
+
+    -- | The agent resolves the dispute in favor of the buyer, refunding the funds.
+    -- | This archives the disputed account and creates a final `RefundReceipt`.
+    choice ResolveDisputeAndRefund : ContractId RefundReceipt
+      with
+        resolutionNotes: Text
+      controller agent
+      do
+        create RefundReceipt with
+          resolutionNotes = Some resolutionNotes
+          ..
