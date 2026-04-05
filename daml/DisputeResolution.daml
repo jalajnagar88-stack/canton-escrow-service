@@ -1,0 +1,103 @@
+-- | This module defines the contracts and choices for handling disputes
+-- | that arise from an escrow agreement. It formalizes the process of
+-- | escalating an issue to a neutral third-party arbitrator and recording
+-- | their final, binding decision.
+--
+-- SPDX-License-Identifier: Apache-2.0
+module DisputeResolution where
+
+import EscrowAccount (EscrowAccount(..))
+
+-- | Defines the possible outcomes of an arbitration process. The arbitrator's
+-- | ruling will either be in favor of the buyer (refund) or the seller (release).
+data ArbitratorRuling
+  = RefundToBuyer
+  | ReleaseToSeller
+  deriving (Eq, Show, Ord)
+
+-- | Represents a dispute that has been escalated to an arbitrator for resolution.
+-- | This contract is typically created by the EscrowAgent when a dispute cannot be
+-- | resolved between the Buyer and Seller directly. It captures the state of the
+-- | escrow, the parties involved, and the reason for the dispute.
+template Dispute
+  with
+    escrowAccountCid : ContractId EscrowAccount
+      -- ^ The ID of the escrow account contract that is under dispute.
+    escrowAccountData : EscrowAccount
+      -- ^ A snapshot of the escrow account data at the time the dispute was raised.
+    buyer : Party
+      -- ^ The buyer party in the escrow agreement.
+    seller : Party
+      -- ^ The seller party in the escrow agreement.
+    escrowAgent : Party
+      -- ^ The neutral escrow agent who oversees the process.
+    arbitrator : Party
+      -- ^ The designated arbitrator responsible for resolving the dispute.
+    reason : Text
+      -- ^ The reason provided for initiating the dispute.
+  where
+    signatory escrowAgent, arbitrator
+    observer buyer, seller
+
+    key (escrowAgent, buyer, seller, escrowAccountCid) : (Party, Party, Party, ContractId EscrowAccount)
+    maintainer key._1
+
+    -- | Allows the designated arbitrator to make a final ruling on the dispute.
+    -- | This action will trigger the corresponding action (refund or release) on the
+    -- | original EscrowAccount contract and create a permanent record of the resolution.
+    choice Resolve : ContractId ResolvedDispute
+      with
+        ruling : ArbitratorRuling
+          -- ^ The arbitrator's final decision.
+        rulingReason : Text
+          -- ^ A detailed explanation for the ruling.
+      controller arbitrator
+      do
+        -- Based on the ruling, exercise the appropriate choice on the escrow account.
+        -- This assumes the `arbitrator` has controlling rights on the `EscrowAccount`
+        -- contract to exercise these choices during a dispute (e.g., choices named
+        -- `Refund` and `Release`).
+        case ruling of
+          RefundToBuyer ->
+            exercise escrowAccountCid Refund with
+              reason = "Arbitrator ruling: " <> rulingReason
+          ReleaseToSeller ->
+            exercise escrowAccountCid Release with
+              reason = "Arbitrator ruling: " <> rulingReason
+
+        -- Create a permanent, non-consumable record of the resolved dispute for audit purposes.
+        create ResolvedDispute with
+          escrowAccountData
+          buyer
+          seller
+          escrowAgent
+          arbitrator
+          disputeReason = reason
+          ruling
+          rulingReason
+
+-- | A non-consumable contract that serves as an immutable audit record
+-- | of a resolved dispute, including the final ruling and justification.
+-- | This contract has no choices and represents a terminal state in the
+-- | dispute resolution workflow.
+template ResolvedDispute
+  with
+    escrowAccountData : EscrowAccount
+      -- ^ The original escrow account data.
+    buyer : Party
+      -- ^ The buyer party.
+    seller : Party
+      -- ^ The seller party.
+    escrowAgent : Party
+      -- ^ The escrow agent.
+    arbitrator : Party
+      -- ^ The arbitrator who made the ruling.
+    disputeReason : Text
+      -- ^ The initial reason for the dispute.
+    ruling : ArbitratorRuling
+      -- ^ The final ruling made by the arbitrator.
+    rulingReason : Text
+      -- ^ The arbitrator's justification for the ruling.
+  where
+    signatory escrowAgent, arbitrator
+    observer buyer, seller
