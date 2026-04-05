@@ -1,0 +1,122 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module EscrowAgent where
+
+import DA.Next.Set qualified as Set
+import EscrowAccount
+import DeliveryConfirmation
+import DisputeResolution
+
+-- | Represents the trusted third-party agent's role in a specific escrow transaction.
+-- This contract orchestrates the entire process, from delivery confirmation to fund release
+-- or dispute resolution. It links the `EscrowAccount`, `DeliveryConfirmation`, and `Dispute`
+-- contracts together.
+template EscrowAgent
+  with
+    agent : Party
+      -- ^ The trusted escrow agent.
+    buyer : Party
+      -- ^ The party purchasing the goods/services.
+    seller : Party
+      -- ^ The party selling the goods/services.
+    escrowAccountId : ContractId EscrowAccount
+      -- ^ The contract holding the funds in escrow.
+    description : Text
+      -- ^ A description of the escrowed transaction.
+    deliveryConfirmationCid : Optional (ContractId DeliveryConfirmation)
+      -- ^ Becomes populated when the buyer confirms delivery.
+    disputeCid : Optional (ContractId Dispute)
+      -- ^ Becomes populated if a dispute is raised.
+  where
+    signatory agent
+    observer buyer, seller
+
+    key (agent, buyer, seller, escrowAccountId) : (Party, Party, Party, ContractId EscrowAccount)
+    maintainer key._1
+
+    -- | The buyer confirms receipt of the goods or services as described.
+    -- This creates a `DeliveryConfirmation` contract, signaling to the agent
+    -- that funds can be released.
+    choice ConfirmDelivery : ContractId EscrowAgent
+      controller buyer
+      do
+        assertMsg "Delivery has already been confirmed or a dispute is active." $
+          isNone deliveryConfirmationCid && isNone disputeCid
+
+        confirmationCid <- create DeliveryConfirmation with confirmer = buyer, agent
+        create this with deliveryConfirmationCid = Some confirmationCid
+
+    -- | The agent releases the escrowed funds to the seller.
+    -- This can only be done after the buyer has confirmed delivery.
+    choice ReleaseFunds : ContractId EscrowReceipt
+      controller agent
+      do
+        confirmationCid <- fromSomeNote "Delivery must be confirmed before releasing funds." deliveryConfirmationCid
+        -- Fetching the confirmation contract ensures it is still active and valid.
+        _ <- fetch confirmationCid
+
+        exercise escrowAccountId ReleaseFunds
+
+    -- | The agent refunds the escrowed funds back to the buyer.
+    -- This is used if the transaction is cancelled by mutual agreement or as a result
+    -- of a dispute resolution. It cannot be done after delivery is confirmed.
+    choice InitiateRefund : ContractId RefundReceipt
+      controller agent
+      do
+        assertMsg "Cannot refund after delivery confirmation." $ isNone deliveryConfirmationCid
+
+        exercise escrowAccountId RefundBuyer
+
+    -- | Either the buyer or seller can raise a dispute if there is a problem with the
+    -- transaction. This prevents fund release until the agent resolves the dispute.
+    choice RaiseDispute : ContractId EscrowAgent
+      with
+        reason: Text
+          -- ^ A description of the reason for the dispute.
+      controller buyer, seller
+      do
+        assertMsg "A dispute is already active for this escrow." $ isNone disputeCid
+        assertMsg "Cannot raise a dispute after delivery has been confirmed." $ isNone deliveryConfirmationCid
+
+        let claimant = signatory
+        let respondent = if claimant == buyer then seller else buyer
+
+        newDisputeCid <- create Dispute
+          with
+            arbitrator = agent
+            claimant
+            respondent
+            escrowAccountId
+            reason
+            observers = Set.fromList []
+
+        create this with disputeCid = Some newDisputeCid
+
+    -- | After arbitration, the agent resolves the dispute in favor of the seller,
+    -- releasing the funds to them.
+    choice ResolveDisputeAndRelease : ContractId EscrowReceipt
+      with
+        resolutionNotes : Text
+          -- ^ The agent's final notes on the resolution.
+      controller agent
+      do
+        activeDisputeCid <- fromSomeNote "No active dispute to resolve." disputeCid
+        -- First, archive the dispute contract, marking it as resolved.
+        exercise activeDisputeCid Resolve with resolution = resolutionNotes
+        -- Second, release the funds from the escrow account to the seller.
+        exercise escrowAccountId ReleaseFunds
+
+    -- | After arbitration, the agent resolves the dispute in favor of the buyer,
+    -- refunding the funds to them.
+    choice ResolveDisputeAndRefund : ContractId RefundReceipt
+      with
+        resolutionNotes : Text
+          -- ^ The agent's final notes on the resolution.
+      controller agent
+      do
+        activeDisputeCid <- fromSomeNote "No active dispute to resolve." disputeCid
+        -- First, archive the dispute contract, marking it as resolved.
+        exercise activeDisputeCid Resolve with resolution = resolutionNotes
+        -- Second, refund the buyer from the escrow account.
+        exercise escrowAccountId RefundBuyer
