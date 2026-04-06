@@ -1,0 +1,175 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module EscrowTest where
+
+import Daml.Script
+import DA.Assert
+import DA.Date as Date
+import DA.Time as Time
+import EscrowAccount
+import DeliveryConfirmation
+import DisputeResolution
+import EscrowAgent
+
+-- === Test Setup ===
+
+setupParties : Script (Party, Party, Party, Party)
+setupParties = do
+  buyer <- allocateParty "Buyer"
+  seller <- allocateParty "Seller"
+  escrowAgent <- allocateParty "EscrowAgent"
+  arbitrator <- allocateParty "Arbitrator"
+  pure (buyer, seller, escrowAgent, arbitrator)
+
+-- === Test Scenarios ===
+
+escrowTest : Script ()
+escrowTest = script do
+  (buyer, seller, escrowAgent, arbitrator) <- setupParties
+
+  -- Create the necessary role contracts
+  escrowAgentRoleCid <- submit escrowAgent do
+    createCmd EscrowAgent.Role with agent = escrowAgent
+  arbitratorRoleCid <- submit arbitrator do
+    createCmd DisputeResolution.ArbitratorRole with arbitrator = arbitrator
+
+  -- Run each test scenario
+  testHappyPathRelease buyer seller escrowAgent escrowAgentRoleCid
+  testRefundPath buyer seller escrowAgent escrowAgentRoleCid
+  testDisputeAndArbitration buyer seller escrowAgent arbitrator escrowAgentRoleCid arbitratorRoleCid
+
+  pure ()
+
+-- Scenario 1: Happy Path - Funds are released to the seller after successful delivery.
+testHappyPathRelease : Party -> Party -> Party -> ContractId EscrowAgent.Role -> Script ()
+testHappyPathRelease buyer seller escrowAgent escrowAgentRoleCid = do
+  debug "--- Running Happy Path Release Test ---"
+
+  let item = "Vintage Watch"
+  let price = 1000.0
+  now <- getTime
+  let deliveryDueDate = Date.addDays (date (Time.toDate now)) 14
+
+  -- Step 1: Buyer proposes an escrow agreement
+  proposalCid <- submit buyer do
+    createCmd EscrowAccount.Proposal with
+      buyer
+      seller
+      escrowAgent
+      item
+      price
+      deliveryDueDate
+
+  -- Step 2: Seller accepts the proposal
+  setupCid <- submit seller do
+    exerciseCmd proposalCid EscrowAccount.Proposal_Accept
+
+  -- Step 3: Escrow agent accepts and confirms funding
+  fundedCid <- submit escrowAgent do
+    exerciseCmd setupCid EscrowAccount.Setup_AcceptAndFund
+
+  -- Step 4: Seller initiates delivery
+  deliveryPendingCid <- submit seller do
+    exerciseCmd fundedCid EscrowAccount.InitiateDelivery
+
+  -- Step 5: Buyer confirms receipt of the goods
+  -- This choice archives the DeliveryConfirmation.Pending contract and exercises
+  -- MarkAsDeliverable on the EscrowAccount.Funded contract.
+  (archivedDelivery, releasedEscrowCid) <- submit buyer do
+    exerciseCmd deliveryPendingCid DeliveryConfirmation.Pending_ConfirmDelivery
+
+  -- Step 6: Escrow agent releases the funds to the seller
+  closedCid <- submit escrowAgent do
+    exerciseCmd releasedEscrowCid EscrowAccount.ReleaseFunds
+
+  -- Final assertion: Verify the account is closed with 'Released' status
+  closedContract <- fetch closedCid
+  assertMsg "Escrow account should be closed with status Released" (closedContract.status == Released)
+  debug "--- Happy Path Release Test Successful ---"
+
+
+-- Scenario 2: Refund Path - Funds are returned to the buyer.
+testRefundPath : Party -> Party -> Party -> ContractId EscrowAgent.Role -> Script ()
+testRefundPath buyer seller escrowAgent escrowAgentRoleCid = do
+  debug "--- Running Refund Path Test ---"
+
+  let item = "Custom Artwork"
+  let price = 500.0
+  now <- getTime
+  let deliveryDueDate = Date.addDays (date (Time.toDate now)) 30
+
+  -- Steps 1-3: Propose, accept, and fund the escrow account
+  proposalCid <- submit buyer do
+    createCmd EscrowAccount.Proposal with buyer, seller, escrowAgent, item, price, deliveryDueDate
+  setupCid <- submit seller do
+    exerciseCmd proposalCid EscrowAccount.Proposal_Accept
+  fundedCid <- submit escrowAgent do
+    exerciseCmd setupCid EscrowAccount.Setup_AcceptAndFund
+
+  -- Step 4: Buyer requests a refund (e.g., seller is unresponsive)
+  refundRequestCid <- submit buyer do
+    exerciseCmd fundedCid EscrowAccount.RequestRefund with reason = "Seller did not ship the item."
+
+  -- Step 5: Seller agrees to the refund
+  -- This archives the RefundRequest and exercises MarkAsRefundable on the Funded contract.
+  (archivedRequest, refundableEscrowCid) <- submit seller do
+    exerciseCmd refundRequestCid EscrowAccount.RefundRequest_ApproveRefund
+
+  -- Step 6: Escrow agent processes the refund to the buyer
+  closedCid <- submit escrowAgent do
+    exerciseCmd refundableEscrowCid EscrowAccount.RefundFunds
+
+  -- Final assertion: Verify the account is closed with 'Refunded' status
+  closedContract <- fetch closedCid
+  assertMsg "Escrow account should be closed with status Refunded" (closedContract.status == Refunded)
+  debug "--- Refund Path Test Successful ---"
+
+
+-- Scenario 3: Dispute and Arbitration Path
+testDisputeAndArbitration :
+  Party -> Party -> Party -> Party -> ContractId EscrowAgent.Role -> ContractId DisputeResolution.ArbitratorRole -> Script ()
+testDisputeAndArbitration buyer seller escrowAgent arbitrator escrowAgentRoleCid arbitratorRoleCid = do
+  debug "--- Running Dispute and Arbitration Test ---"
+
+  let item = "Antique Vase"
+  let price = 2500.0
+  now <- getTime
+  let deliveryDueDate = Date.addDays (date (Time.toDate now)) 7
+
+  -- Steps 1-4: Propose, accept, fund, and deliver
+  proposalCid <- submit buyer do
+    createCmd EscrowAccount.Proposal with buyer, seller, escrowAgent, item, price, deliveryDueDate
+  setupCid <- submit seller do
+    exerciseCmd proposalCid EscrowAccount.Proposal_Accept
+  fundedCid <- submit escrowAgent do
+    exerciseCmd setupCid EscrowAccount.Setup_AcceptAndFund
+  deliveryPendingCid <- submit seller do
+    exerciseCmd fundedCid EscrowAccount.InitiateDelivery
+
+  -- Step 5: Buyer disputes the delivery (e.g., item is not as described)
+  -- This creates a DisputeResolution.Pending contract.
+  disputePendingCid <- submit buyer do
+    exerciseCmd deliveryPendingCid DeliveryConfirmation.Pending_DisputeDelivery with
+      reason = "The vase arrived with a large crack."
+
+  -- Step 6: Escrow agent escalates the dispute to a neutral arbitrator
+  arbitratingCid <- submit escrowAgent do
+    exerciseCmd disputePendingCid DisputeResolution.Pending_EscalateToArbitrator with
+      arbitrator
+      arbitratorRoleCid
+
+  -- Step 7: Arbitrator reviews the case and rules in favor of the buyer
+  -- This choice archives the Arbitrating contract and exercises MarkAsRefundable on the Funded contract.
+  (archivedArbitration, refundableEscrowCid) <- submit arbitrator do
+    exerciseCmd arbitratingCid DisputeResolution.Arbitrating_RuleInFavorOfBuyer with
+      ruling = "Evidence confirms the item was damaged. A full refund is warranted."
+
+  -- Step 8: Escrow agent processes the refund based on the arbitrator's ruling
+  closedCid <- submit escrowAgent do
+    exerciseCmd refundableEscrowCid EscrowAccount.RefundFunds
+
+  -- Final assertion: Verify the account is closed with 'Refunded' status after arbitration
+  closedContract <- fetch closedCid
+  assertMsg "Escrow account should be closed with status Refunded after arbitration" (closedContract.status == Refunded)
+  debug "--- Dispute and Arbitration Test Successful ---"
