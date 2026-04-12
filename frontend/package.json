@@ -1,0 +1,38 @@
+{
+  "name": "canton-escrow-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
+    "preview": "vite preview",
+    "codegen": "dpm codegen-alpha-typescript ../.daml/dist/canton-escrow-service-0.1.0.dar --output-dir src/daml/ --main-package-id $(dpm damlc inspect-dar --json ../.daml/dist/canton-escrow-service-0.1.0.dar | jq -r .main_package_id)"
+  },
+  "dependencies": {
+    "@c7/ledger": "3.4.0",
+    "@c7/react": "3.4.0",
+    "@daml-finance/dapp-sdk": "^2.1.0",
+    "@daml-finance/discovery-component": "^2.1.0",
+    "@emotion/react": "^11.11.4",
+    "@emotion/styled": "^11.11.5",
+    "@mui/icons-material": "^5.15.19",
+    "@mui/material": "^5.15.19",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.23.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@typescript-eslint/eslint-plugin": "^7.11.0",
+    "@typescript-eslint/parser": "^7.11.0",
+    "@vitejs/plugin-react": "^4.3.0",
+    "eslint": "^8.57.0",
+    "eslint-plugin-react-hooks": "^4.6.2",
+    "eslint-plugin-react-refresh": "^0.4.7",
+    "typescript": "^5.4.5",
+    "vite": "^5.2.12"
+  }
+}
