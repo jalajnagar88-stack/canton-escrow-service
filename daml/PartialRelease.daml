@@ -1,0 +1,53 @@
+-- | This module defines the data type and validation logic for handling partial
+-- | releases of funds from an escrow contract. This is essential for use cases
+-- | involving milestone-based payments or phased deliveries.
+module Escrow.PartialRelease where
+
+-- | Represents an instruction to perform a partial release of funds from an escrow account.
+-- This is typically used for milestone-based payments where parts of the total amount
+-- are released as project phases are completed. The instruction must specify both the
+-- amount to release and the amount that will remain, ensuring the total is conserved.
+data PartialRelease = PartialRelease
+  with
+    releaseAmount : Decimal
+      -- ^ The amount of funds to be released to the seller in this partial payment.
+      -- This value must be greater than zero.
+    remainingAmount : Decimal
+      -- ^ The amount of funds that will remain in escrow after this release.
+      -- This value must be zero or greater.
+    reason : Text
+      -- ^ A description of the milestone or reason for this partial release. This provides
+      -- an auditable record of why funds were released.
+  deriving (Eq, Show)
+
+-- | Validates a `PartialRelease` instruction against the total amount currently held in escrow.
+-- It ensures that the proposed release is financially sound and consistent with the state
+-- of the escrow contract.
+--
+-- Returns `Right ()` on successful validation, or `Left errorMsg` on failure.
+--
+-- The validation checks are:
+-- 1. The `releaseAmount` must be a positive number.
+-- 2. The `remainingAmount` must be non-negative.
+-- 3. The sum of `releaseAmount` and `remainingAmount` must exactly equal the
+--    `totalEscrowedAmount`. This prevents accidental creation or destruction of value.
+validatePartialRelease
+  : Decimal       -- ^ The total amount currently held in the escrow contract.
+  -> PartialRelease -- ^ The partial release instruction to validate.
+  -> Either Text () -- ^ The result of the validation.
+validatePartialRelease totalEscrowedAmount release =
+  let
+    totalFromRelease = release.releaseAmount + release.remainingAmount
+    errorPrefix = "Partial release validation failed: "
+  in if
+    | release.releaseAmount <= 0.0 ->
+        Left $ errorPrefix <> "Release amount must be positive, but got " <> show release.releaseAmount <> "."
+    | release.remainingAmount < 0.0 ->
+        Left $ errorPrefix <> "Remaining amount cannot be negative, but got " <> show release.remainingAmount <> "."
+    | totalFromRelease /= totalEscrowedAmount ->
+        Left $ errorPrefix <> "The sum of the release amount (" <> show release.releaseAmount <>
+               ") and remaining amount (" <> show release.remainingAmount <>
+               ") is " <> show totalFromRelease <> ", which does not match the total escrowed amount of " <>
+               show totalEscrowedAmount <> "."
+    | otherwise ->
+        Right ()
