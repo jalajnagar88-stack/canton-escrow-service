@@ -3,100 +3,118 @@
 
 module DisputeResolution where
 
-import Daml.Script
-import DA.Time (Time, addRelTime, relTime)
-import Escrow (Escrow)
+import DA.Time (Time)
+import Escrow (Escrow(..))
 
--- | Defines the parameters needed to create a new dispute case.
-data CreateDispute = CreateDispute
-  with
-    escrowCid : ContractId Escrow
-      -- ^ The specific escrow contract being disputed.
-    reason : Text
-      -- ^ A description of the dispute.
-    arbitrator : Party
-      -- ^ The party designated to resolve the dispute.
-    buyer : Party
-      -- ^ The buyer from the original escrow.
-    seller : Party
-      -- ^ The seller from the original escrow.
+-- | Defines the possible outcomes of an arbitration process for a disputed escrow.
+data Ruling
+  = RuleInFavorOfSeller
+    -- ^ The arbitrator rules entirely in favor of the seller.
+    -- The full escrowed amount will be released to the seller.
+  | RuleInFavorOfBuyer
+    -- ^ The arbitrator rules entirely in favor of the buyer.
+    -- The full escrowed amount will be refunded to the buyer.
+  | RuleWithPartialSplit with
+      amountToSeller: Decimal
+      -- ^ The portion of the escrowed amount to be released to the seller.
+      amountToBuyer: Decimal
+      -- ^ The portion of the escrowed amount to be refunded to the buyer.
   deriving (Eq, Show)
 
--- | Represents an active dispute case escalated from an Escrow contract.
--- An arbitrator is assigned to resolve the conflict between the buyer and seller.
--- A deadline is set for the arbitrator to make a decision, after which the
--- escrow agent can replace them to prevent a deadlock.
+-- | Represents an escrow agreement that has entered the dispute resolution phase.
+-- An arbitrator is assigned to adjudicate the case and make a final ruling. This
+-- contract acts as an authorization for the arbitrator to resolve the underlying
+-- escrow contract on behalf of the signatories.
 template Dispute
   with
-    escrowAgent : Party
-      -- ^ The neutral party managing the escrow and dispute process.
-    buyer : Party
-      -- ^ The party who purchased the goods/service.
-    seller : Party
-      -- ^ The party who sold the goods/service.
-    arbitrator : Party
-      -- ^ The designated third-party resolver for this dispute.
-    escrowCid : ContractId Escrow
-      -- ^ The original Escrow contract that this dispute relates to.
-    reason : Text
-      -- ^ A description of why the dispute was initiated.
-    submittedAt : Time
-      -- ^ The timestamp when the dispute was formally submitted.
-    resolutionDeadline : Time
-      -- ^ The timestamp by which the arbitrator must make a ruling.
-
+    buyer          : Party
+      -- ^ The party who originally deposited the funds.
+    seller         : Party
+      -- ^ The party who was to receive the funds upon successful delivery.
+    escrowAgent    : Party
+      -- ^ The neutral agent managing the escrow.
+    arbitrator     : Party
+      -- ^ The designated neutral third party to resolve the dispute.
+    escrowContractId: ContractId Escrow
+      -- ^ The original `Escrow` contract under dispute.
+    totalAmount    : Decimal
+      -- ^ The total amount held in escrow.
+    reason         : Text
+      -- ^ The reason provided for initiating the dispute.
   where
-    signatory escrowAgent, arbitrator
-    observer buyer, seller
+    signatory buyer, seller, escrowAgent
 
-    key (escrowAgent, escrowCid) : (Party, ContractId Escrow)
-    maintainer key._1
+    observer arbitrator
 
-    -- | Allows the arbitrator to rule in favor of the buyer, triggering a refund from the escrow.
-    -- This choice must be exercised before the resolution deadline passes.
-    choice ResolveForBuyer : ()
-      controller arbitrator
-      do
-        now <- getTime
-        assertMsg "Arbitrator's decision deadline has passed." (now <= resolutionDeadline)
+    ensure
+      totalAmount > 0.0
 
-        -- This choice consumes the Escrow contract, which in turn will
-        -- archive this Dispute contract via consuming choices.
-        exercise escrowCid Escrow.RefundBuyer with
-          reasonForAction = "Dispute resolved in favor of buyer by arbitrator " <> show arbitrator <> ". Original reason: " <> reason
+    key (buyer, seller, escrowContractId) : (Party, Party, ContractId Escrow)
+    maintainer key._1, key._2
 
-    -- | Allows the arbitrator to rule in favor of the seller, triggering payment release from the escrow.
-    -- This choice must be exercised before the resolution deadline passes.
-    choice ResolveForSeller : ()
-      controller arbitrator
-      do
-        now <- getTime
-        assertMsg "Arbitrator's decision deadline has passed." (now <= resolutionDeadline)
-
-        -- This choice consumes the Escrow contract, which in turn will
-        -- archive this Dispute contract via consuming choices.
-        exercise escrowCid Escrow.ReleasePayment with
-          reasonForAction = "Dispute resolved in favor of seller by arbitrator " <> show arbitrator <> ". Original reason: " <> reason
-
-    -- | Allows the escrow agent to replace an unresponsive arbitrator if they
-    -- have failed to make a decision by the specified deadline. This prevents
-    -- disputes from becoming deadlocked.
-    choice ReplaceArbitrator : ContractId Dispute
+    -- | Allows the designated arbitrator to record their final ruling on the dispute.
+    -- This action is final and will trigger the distribution of funds from the
+    -- original escrow contract according to the ruling, consuming this dispute
+    -- contract in the process.
+    choice RecordRuling : ContractId RulingReceipt
       with
-        newArbitrator : Party
-          -- ^ The party to be assigned as the new arbitrator.
-        newDeadlineDurationSeconds : Int
-          -- ^ The number of seconds from now for the new resolution deadline.
-      controller escrowAgent
+        ruling: Ruling
+          -- ^ The arbitrator's final decision.
+        rulingTime: Time
+          -- ^ The timestamp of the ruling.
+      controller arbitrator
       do
-        now <- getTime
-        assertMsg "Cannot replace arbitrator before the resolution deadline has passed." (now > resolutionDeadline)
-        assertMsg "New arbitrator cannot be the same as the current one." (newArbitrator /= arbitrator)
-        assertMsg "New deadline duration must be positive." (newDeadlineDurationSeconds > 0)
+        -- Validate that the ruling amounts are consistent for partial splits.
+        case ruling of
+          RuleWithPartialSplit {amountToSeller, amountToBuyer} ->
+            ensureMsg "Partial split amounts must be non-negative and sum to the total escrowed amount." $
+              amountToSeller >= 0.0 && amountToBuyer >= 0.0 &&
+              amountToSeller + amountToBuyer == totalAmount
+          _ -> pure ()
 
-        -- Archive the current dispute and create a new one with the new
-        -- arbitrator and a fresh deadline.
-        create this with
-          arbitrator = newArbitrator
-          submittedAt = now
-          resolutionDeadline = addRelTime now (relTime newDeadlineDurationSeconds 0 0)
+        -- The authority of the escrowAgent (a signatory on this `Dispute` contract) is
+        -- implicitly carried into this choice's context. This authority allows the
+        -- exercise of the `ResolveDispute` choice on the underlying `Escrow` contract,
+        -- which is controlled by the `escrowAgent`.
+        exercise escrowContractId ResolveDispute with ruling
+
+        -- Create a final receipt to serve as a permanent, auditable record of the resolution.
+        create RulingReceipt with
+          buyer
+          seller
+          escrowAgent
+          arbitrator
+          escrowContractId
+          totalAmount
+          reason
+          ruling
+          rulingTime
+
+-- | A final, auditable record of a dispute and its resolution by an arbitrator.
+-- This contract is created upon the successful resolution of a `Dispute` contract
+-- and serves as immutable proof of the outcome for all involved parties.
+template RulingReceipt
+  with
+    buyer          : Party
+      -- ^ The party who originally deposited the funds.
+    seller         : Party
+      -- ^ The party who was to receive the funds upon successful delivery.
+    escrowAgent    : Party
+      -- ^ The neutral agent managing the escrow.
+    arbitrator     : Party
+      -- ^ The arbitrator who made the ruling.
+    escrowContractId: ContractId Escrow
+      -- ^ The original escrow contract that was disputed.
+    totalAmount    : Decimal
+      -- ^ The total amount that was held in escrow.
+    disputeReason  : Text
+      -- ^ The original reason for the dispute.
+    ruling         : Ruling
+      -- ^ The final ruling made by the arbitrator.
+    rulingTime     : Time
+      -- ^ The timestamp of when the ruling was recorded.
+  where
+    signatory buyer, seller, escrowAgent, arbitrator
+
+    key (arbitrator, escrowContractId) : (Party, ContractId Escrow)
+    maintainer key._1
