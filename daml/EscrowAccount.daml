@@ -5,198 +5,200 @@
 
 module EscrowAccount where
 
--- This module assumes the existence of an `EscrowAgreement` template,
--- which captures the initial terms agreed upon by all parties.
--- A typical flow would be:
--- 1. `EscrowAgreement` is created.
--- 2. A choice on `EscrowAgreement` is exercised to fund the escrow,
---    which creates this `EscrowAccount` contract.
-import EscrowAgreement (EscrowAgreement)
+import Daml.Finance.Interface.Types.Common.Types (InstrumentKey)
+import PartialRelease (PartialReleaseRequest)
+import DA.Set (Set)
+import qualified DA.Set as Set
+import DA.Assert (assertMsg)
 
--- | Receipt for a successfully completed escrow transaction where funds were
--- | released to the seller. This is a terminal contract.
-template PaymentReceipt
+-- | Represents an escrow account that has entered a dispute state.
+-- The funds are frozen, pending a ruling from the designated arbiters.
+template DisputedAccount
   with
-    buyer: Party
-    seller: Party
-    agent: Party
-    amount: Decimal
-    currency: Text
-    agreementCid: ContractId EscrowAgreement
-    resolutionNotes: Optional Text -- Populated if the payment was the result of a dispute resolution.
+    escrowAgent : Party
+    buyer : Party
+    seller : Party
+    amount : Decimal
+    instrument : InstrumentKey
+    description : Text
+    arbiters : Set Party
+    claimant : Party
+    reason : Text
   where
-    signatory agent
+    signatory (Set.toList arbiters) ++ [escrowAgent]
     observer buyer, seller
 
--- | Receipt for a refunded escrow transaction where funds were returned
--- | to the buyer. This is a terminal contract.
-template RefundReceipt
-  with
-    buyer: Party
-    seller: Party
-    agent: Party
-    amount: Decimal
-    currency: Text
-    agreementCid: ContractId EscrowAgreement
-    resolutionNotes: Optional Text -- Populated if the refund was the result of a dispute resolution.
-  where
-    signatory agent
-    observer buyer, seller
+    -- The key uniquely identifies the disputed account.
+    key (escrowAgent, buyer, seller, instrument) : (Party, Party, Party, InstrumentKey)
+    maintainer key._1
 
--- | Represents an explicit confirmation from the buyer that the goods/services
--- | have been delivered. The agent can use this contract as authorization to
--- | release the funds from the escrow account.
-template DeliveryConfirmation
-  with
-    buyer: Party
-    seller: Party
-    agent: Party
-    accountCid: ContractId EscrowAccount
-  where
-    signatory buyer
-    observer agent, seller
+    -- | Arbiters rule in favor of the buyer.
+    -- This choice is consuming and represents the event of a refund being issued.
+    choice ResolveForBuyer : ()
+      with
+        ruling : Text
+      controller arbiters
+      do
+        -- In a real-world scenario, this would trigger an instruction to transfer
+        -- `amount` of `instrument` from the `escrowAgent` to the `buyer`.
+        -- Archiving the contract signifies the completion of this process.
+        return ()
 
--- | Represents explicit authorization from the seller to refund the buyer.
--- | This is used for non-disputed refunds. The agent can use this contract
--- | as authorization to process the refund.
-template RefundAuthorization
-  with
-    buyer: Party
-    seller: Party
-    agent: Party
-    accountCid: ContractId EscrowAccount
-  where
-    signatory seller
-    observer agent, buyer
+    -- | Arbiters rule in favor of the seller.
+    -- This choice is consuming and represents the event of funds being released to the seller.
+    choice ResolveForSeller : ()
+      with
+        ruling : Text
+      controller arbiters
+      do
+        -- In a real-world scenario, this would trigger an instruction to transfer
+        -- `amount` of `instrument` from the `escrowAgent` to the `seller`.
+        -- Archiving the contract signifies the completion of this process.
+        return ()
 
--- | Represents a funded escrow account. This is the primary active state
--- | where the agent holds the buyer's funds, awaiting confirmation of delivery,
--- | a refund request, or a dispute.
+-- | The primary escrow contract holding the buyer's funds.
+-- It manages the lifecycle of the escrow, from funding to release, refund, or dispute.
 template EscrowAccount
   with
+    escrowId: Text
+    escrowAgent: Party
     buyer: Party
     seller: Party
-    agent: Party
-    amount: Decimal
-    currency: Text
-    agreementCid: ContractId EscrowAgreement
+    instrument: InstrumentKey
+    description: Text
+    -- The total initial amount deposited into escrow.
+    initialAmount: Decimal
+    -- The amount currently remaining in the escrow account. Can be reduced by partial releases.
+    remainingAmount: Decimal
+    arbiters: Set Party
+    -- State flags for delivery confirmation
+    buyerHasConfirmed: Bool
+    sellerHasConfirmed: Bool
+    -- State flags for refund agreement
+    buyerWantsRefund: Bool
+    sellerWantsRefund: Bool
   where
-    signatory agent
-    observer buyer, seller
+    signatory escrowAgent, buyer, seller
+    observer arbiters
 
-    ensure amount > 0.0
+    ensure
+      initialAmount > 0.0 &&
+      remainingAmount >= 0.0 && remainingAmount <= initialAmount &&
+      escrowAgent /= buyer && escrowAgent /= seller && buyer /= seller &&
+      not (Set.member buyer arbiters) && not (Set.member seller arbiters)
 
-    key (agent, agreementCid) : (Party, ContractId EscrowAgreement)
+    key (escrowAgent, buyer, seller, escrowId) : (Party, Party, Party, Text)
     maintainer key._1
 
-    -- | The buyer confirms they have received the goods/services as per the agreement.
-    -- | This creates a `DeliveryConfirmation` contract, which serves as a durable,
-    -- | on-ledger instruction for the agent to release the funds.
-    choice BuyerConfirmsDelivery : ContractId DeliveryConfirmation
-      controller buyer
+    -- | A party (buyer or seller) confirms that the transaction is complete.
+    -- If this is the second confirmation, the contract is archived, representing
+    -- the release of the remaining funds to the seller.
+    -- If this is the first confirmation, the contract is updated with the new state.
+    choice ConfirmDelivery : Either () (ContractId EscrowAccount)
+      controller buyer, seller
       do
-        create DeliveryConfirmation with
-          buyer
-          seller
-          agent
-          accountCid = self
+        let confirmingParty = signatory
+        let isBuyerConfirming = confirmingParty == buyer
+        let isSellerConfirming = confirmingParty == seller
 
-    -- | The seller agrees to refund the buyer. This might occur if the seller
-    -- | cannot fulfill the order. This creates a `RefundAuthorization` contract
-    -- | for the agent to process the refund.
-    choice SellerAuthorizesRefund : ContractId RefundAuthorization
+        assertMsg "Party has already confirmed delivery." $
+          (isBuyerConfirming && not buyerHasConfirmed) ||
+          (isSellerConfirming && not sellerHasConfirmed)
+
+        assertMsg "Cannot confirm delivery if a refund process has started." $
+          not buyerWantsRefund && not sellerWantsRefund
+
+        if (isBuyerConfirming && sellerHasConfirmed) || (isSellerConfirming && buyerHasConfirmed) then do
+          -- This is the second confirmation; the agreement is fulfilled.
+          -- The contract is archived, representing the release of funds to the seller.
+          return (Left ())
+        else
+          -- This is the first confirmation. Update state and recreate the contract.
+          cid <- create this with
+            buyerHasConfirmed = buyerHasConfirmed || isBuyerConfirming
+            sellerHasConfirmed = sellerHasConfirmed || isSellerConfirming
+          return (Right cid)
+
+    -- | A party (buyer or seller) signals their intent to refund the transaction.
+    -- If both parties agree, the contract is archived, representing the funds
+    -- being returned to the buyer.
+    choice SignalRefundIntent : Either () (ContractId EscrowAccount)
+      controller buyer, seller
+      do
+        let party = signatory
+        let isBuyer = party == buyer
+        let isSeller = party == seller
+
+        let newBuyerWantsRefund = buyerWantsRefund || isBuyer
+        let newSellerWantsRefund = sellerWantsRefund || isSeller
+
+        assertMsg "Party has already signaled intent for refund." $
+          (isBuyer && not buyerWantsRefund) || (isSeller && not sellerWantsRefund)
+
+        assertMsg "Cannot request a refund if delivery confirmation has started." $
+          not buyerHasConfirmed && not sellerHasConfirmed
+
+        if newBuyerWantsRefund && newSellerWantsRefund then
+          -- Both parties agree to a refund.
+          -- Contract is archived, representing the return of funds to the buyer.
+          return (Left ())
+        else
+          -- This is the first signal. Update state and recreate the contract.
+          cid <- create this with
+            buyerWantsRefund = newBuyerWantsRefund
+            sellerWantsRefund = newSellerWantsRefund
+          return (Right cid)
+
+    -- | The seller requests a partial release of funds, e.g., for a project milestone.
+    -- This creates a `PartialReleaseRequest` that the buyer must approve.
+    choice RequestPartialRelease : ContractId PartialReleaseRequest
+      with
+        releaseAmount: Decimal
+        reason: Text
       controller seller
       do
-        create RefundAuthorization with
-          buyer
-          seller
-          agent
-          accountCid = self
+        assertMsg "Release amount must be positive." (releaseAmount > 0.0)
+        assertMsg "Release amount cannot exceed remaining funds." (releaseAmount <= remainingAmount)
+        assertMsg "Cannot request partial release after confirmation or refund process has started." $
+          not buyerHasConfirmed && not sellerHasConfirmed && not buyerWantsRefund && not sellerWantsRefund
 
-    -- | The agent acts on the buyer's confirmation to release funds to the seller.
-    -- | This choice consumes the `DeliveryConfirmation` and the `EscrowAccount`,
-    -- | and produces a final `PaymentReceipt`.
-    choice AgentReleasesFunds : ContractId PaymentReceipt
-      with
-        confirmationCid: ContractId DeliveryConfirmation
-      controller agent
-      do
-        confirmation <- fetch confirmationCid
-        assertMsg "The provided delivery confirmation is not for this escrow account."
-          (confirmation.accountCid == self)
-
-        archive confirmationCid
-        create PaymentReceipt with resolutionNotes = None, ..
-
-    -- | The agent acts on the seller's authorization to refund the buyer.
-    -- | This choice consumes the `RefundAuthorization` and `EscrowAccount`,
-    -- | and produces a final `RefundReceipt`.
-    choice AgentProcessesRefund : ContractId RefundReceipt
-      with
-        authorizationCid: ContractId RefundAuthorization
-      controller agent
-      do
-        authorization <- fetch authorizationCid
-        assertMsg "The provided refund authorization is not for this escrow account."
-          (authorization.accountCid == self)
-
-        archive authorizationCid
-        create RefundReceipt with resolutionNotes = None, ..
-
-    -- | Either the buyer or seller can raise a dispute, escalating the issue to the
-    -- | agent for manual resolution. This transitions the state by archiving this
-    -- | account and creating a `DisputedEscrowAccount`.
-    choice RaiseDispute : ContractId DisputedEscrowAccount
-      with
-        disputer: Party
-        reason: Text
-      controller disputer
-      do
-        assertMsg "Only the buyer or seller can raise a dispute."
-          (disputer == buyer || disputer == seller)
-
-        create DisputedEscrowAccount with
-          disputer
+        create PartialReleaseRequest with
+          escrowAccountCid = self
+          escrowAgent, buyer, seller
+          amount = releaseAmount
           reason
-          ..
 
--- | Represents an escrow account that is under dispute. In this state, fund
--- | movement is frozen until the agent investigates and makes a ruling.
-template DisputedEscrowAccount
-  with
-    buyer: Party
-    seller: Party
-    agent: Party
-    amount: Decimal
-    currency: Text
-    agreementCid: ContractId EscrowAgreement
-    disputer: Party
-    reason: Text
-  where
-    signatory agent
-    observer buyer, seller
-
-    key (agent, agreementCid) : (Party, ContractId EscrowAgreement)
-    maintainer key._1
-
-    -- | The agent resolves the dispute in favor of the seller, releasing the funds.
-    -- | This archives the disputed account and creates a final `PaymentReceipt`.
-    choice ResolveDisputeAndRelease : ContractId PaymentReceipt
+    -- | The escrow agent executes a partial release.
+    -- This choice is intended to be called by an approved `PartialReleaseRequest`.
+    -- It consumes the current escrow account and creates a new one with a reduced
+    -- balance, or archives it if the balance becomes zero.
+    choice ExecutePartialRelease : Optional (ContractId EscrowAccount)
       with
-        resolutionNotes: Text
-      controller agent
+        releaseAmount: Decimal
+      controller escrowAgent
       do
-        create PaymentReceipt with
-          resolutionNotes = Some resolutionNotes
-          ..
+        assertMsg "Release amount must be positive." (releaseAmount > 0.0)
+        assertMsg "Release amount cannot exceed remaining funds." (releaseAmount <= remainingAmount)
 
-    -- | The agent resolves the dispute in favor of the buyer, refunding the funds.
-    -- | This archives the disputed account and creates a final `RefundReceipt`.
-    choice ResolveDisputeAndRefund : ContractId RefundReceipt
+        let newRemaining = remainingAmount - releaseAmount
+        if newRemaining > 0.0 then do
+          cid <- create this with remainingAmount = newRemaining
+          return (Some cid)
+        else
+          -- The entire remaining balance has been released. The escrow is now complete.
+          return None
+
+    -- | Either the buyer or the seller can raise a dispute.
+    -- This archives the current account and creates a `DisputedAccount`,
+    -- escalating the issue to the designated arbiters.
+    choice RaiseDispute : ContractId DisputedAccount
       with
-        resolutionNotes: Text
-      controller agent
+        reason: Text
+      controller buyer, seller
       do
-        create RefundReceipt with
-          resolutionNotes = Some resolutionNotes
-          ..
+        create DisputedAccount with
+          escrowAgent, buyer, seller
+          amount = remainingAmount
+          instrument, description, arbiters
+          claimant = signatory
+          reason
