@@ -1,45 +1,34 @@
 -- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
 -- SPDX-License-Identifier: Apache-2.0
 
-module DeliveryConfirmation where
+module Escrow.DeliveryConfirmation where
 
-import DA.Time (Time)
-import EscrowAccount (EscrowAccount)
+import Daml.Assert
 
--- | Represents the buyer's formal confirmation that the goods or services
--- | associated with an escrow account have been delivered to their satisfaction.
--- | The creation of this contract is the action (the "choice") the buyer takes
--- | to signal that funds can be released. It serves as an immutable, on-ledger
--- | proof of receipt, visible to the seller and the escrow agent.
-template DeliveryConfirmation
-  with
-    buyer : Party
-      -- ^ The party who received the goods/services and is confirming delivery.
-    seller : Party
-      -- ^ The party who provided the goods/services.
-    escrowAgent : Party
-      -- ^ The neutral third party overseeing the escrow.
-    escrowCid : ContractId EscrowAccount
-      -- ^ The contract ID of the parent `EscrowAccount` this confirmation is for.
-    confirmationTime : Time
-      -- ^ The timestamp of when the buyer confirmed delivery.
-    comments : Optional Text
-      -- ^ Optional comments from the buyer regarding the delivery.
+import Escrow.Model (Escrow(..), EscrowStatus(..))
 
-  where
-    signatory buyer
-    observer seller, escrowAgent
+-- | This module extends the base `Escrow` template with the `ConfirmDelivery` choice.
+-- This choice is a critical step in the escrow lifecycle, representing the buyer's
+-- acceptance of the delivered goods or services. Once delivery is confirmed, the
+-- escrow can proceed to the fund release phase.
 
-    -- The key ensures that a buyer can only issue one delivery confirmation per
-    -- escrow account, preventing duplicate signals and potential confusion.
-    key (buyer, escrowCid) : (Party, ContractId EscrowAccount)
-    maintainer key._1
+template instance Escrow with
 
-    -- | This choice allows the escrow agent to archive the confirmation notice
-    -- | once it has been processed (i.e., after funds are released).
-    -- | This is a standard lifecycle management pattern to keep the active
-    -- | contract set clean and relevant.
-    choice AcknowledgeAndArchive : ()
-      controller escrowAgent
-      do
-        pure ()
+  -- | Allows the `buyer` to formally acknowledge the satisfactory receipt of the
+  -- goods or services as specified in the escrow agreement.
+  --
+  -- Pre-conditions:
+  --   - The escrow must be in the `Funded` state. A buyer cannot confirm delivery
+  --     if the funds have already been released, refunded, or if a dispute is active.
+  --
+  -- Post-conditions:
+  --   - The escrow contract's status is updated to `DeliveryConfirmed`.
+  --   - This transition enables the `ReleaseFunds` choice for the seller and agent.
+  choice ConfirmDelivery : ContractId Escrow
+    controller buyer
+    do
+      assertMsg "Escrow must be in 'Funded' state to confirm delivery." $
+        self.status == Funded
+
+      create this with
+        status = DeliveryConfirmed
