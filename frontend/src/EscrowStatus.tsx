@@ -1,134 +1,175 @@
 import React from 'react';
-// This import path assumes DPM has generated JS bindings for the `canton-escrow-service`
-// package, version 0.1.0, into the `node_modules` directory.
-import { Escrow } from '@daml.js/canton-escrow-service-0.1.0/lib/Escrow/Model';
+import { FaHourglassHalf, FaTruck, FaGavel, FaCheckCircle, FaUndo } from 'react-icons/fa';
 
 /**
- * Defines the properties (props) that the EscrowStatus component accepts.
+ * Defines the possible lifecycle statuses of an escrow agreement.
+ * This should correspond to the state derivable from the active contracts on the ledger.
  */
+export type EscrowLifecycleStatus =
+  | "Funded"
+  | "GoodsDelivered"
+  | "Disputed"
+  | "Completed"
+  | "Refunded"
+  | "ArbitratedRelease"
+  | "ArbitratedRefund";
+
 interface EscrowStatusProps {
-  /** The active Escrow contract instance whose status is to be displayed. */
-  escrow: Escrow;
+  /** The current status of the escrow agreement. */
+  status: EscrowLifecycleStatus;
 }
 
-/**
- * Defines the visual and descriptive details for each possible escrow status.
- */
-interface StatusDetails {
+interface StatusConfig {
   text: string;
-  color: string;
-  backgroundColor: string;
   description: string;
+  color: string;
+  icon: React.ReactElement;
+  step: number;
 }
 
-/**
- * A mapping from the Daml EscrowStatus variant names to their corresponding
- * display properties. This centralizes the presentation logic.
- */
-const statusMap: Record<string, StatusDetails> = {
+// Configuration mapping each status to its UI representation.
+const statusConfig: Record<EscrowLifecycleStatus, StatusConfig> = {
   Funded: {
-    text: 'Funded',
-    color: '#00529B',
-    backgroundColor: '#BDE5F8',
-    description: 'Buyer has deposited funds. Awaiting seller to confirm delivery of goods/services.',
+    text: "Funded",
+    description: "Buyer has deposited funds. Awaiting seller to confirm delivery.",
+    color: "bg-blue-100 text-blue-800",
+    icon: <FaHourglassHalf />,
+    step: 1,
   },
-  DeliveryConfirmed: {
-    text: 'Delivery Confirmed',
-    color: '#9F6000',
-    backgroundColor: '#FEEFB3',
-    description: 'Seller has confirmed delivery. Awaiting buyer to confirm satisfactory receipt.',
-  },
-  Completed: {
-    text: 'Completed',
-    color: '#4F8A10',
-    backgroundColor: '#DFF2BF',
-    description: 'Transaction complete. Funds have been released to the seller.',
+  GoodsDelivered: {
+    text: "Goods Delivered",
+    description: "Seller has confirmed delivery. Awaiting buyer's confirmation to release funds.",
+    color: "bg-yellow-100 text-yellow-800",
+    icon: <FaTruck />,
+    step: 2,
   },
   Disputed: {
-    text: 'Disputed',
-    color: '#D8000C',
-    backgroundColor: '#FFD2D2',
-    description: 'A dispute has been raised. The escrow agent will now arbitrate.',
+    text: "Disputed",
+    description: "A dispute has been raised. The escrow agent will review and mediate.",
+    color: "bg-orange-100 text-orange-800",
+    icon: <FaGavel />,
+    step: 3, // Off the main path
+  },
+  Completed: {
+    text: "Completed",
+    description: "Buyer confirmed receipt. Funds have been released to the seller.",
+    color: "bg-green-100 text-green-800",
+    icon: <FaCheckCircle />,
+    step: 4,
   },
   Refunded: {
-    text: 'Refunded',
-    color: '#555',
-    backgroundColor: '#e9ecef',
-    description: 'Dispute resolved in favor of the buyer. Funds have been refunded.',
+    text: "Refunded",
+    description: "The agreement was canceled. Funds have been returned to the buyer.",
+    color: "bg-gray-100 text-gray-800",
+    icon: <FaUndo />,
+    step: 4,
   },
-  Released: {
-    text: 'Released',
-    color: '#00705a',
-    backgroundColor: '#d1e7dd',
-    description: 'Dispute resolved in favor of the seller. Funds have been released.',
+  ArbitratedRelease: {
+    text: "Resolved: Released",
+    description: "The dispute was resolved by an arbitrator. Funds have been released to the seller.",
+    color: "bg-green-100 text-green-800",
+    icon: <FaCheckCircle />,
+    step: 4,
+  },
+  ArbitratedRefund: {
+    text: "Resolved: Refunded",
+    description: "The dispute was resolved by an arbitrator. Funds have been returned to the buyer.",
+    color: "bg-gray-100 text-gray-800",
+    icon: <FaUndo />,
+    step: 4,
   },
 };
 
-const defaultStatus: StatusDetails = {
-  text: 'Unknown',
-  color: '#6c757d',
-  backgroundColor: '#e9ecef',
-  description: 'The escrow contract is in an unknown or unrecognized state.',
-};
+const steps = [
+  { id: 1, name: 'Funded' },
+  { id: 2, name: 'Delivered' },
+  { id: 3, name: 'Completed' },
+];
 
 /**
- * A React component that renders a status card for an Escrow contract.
- * It provides a clear, color-coded visual indicator of the current stage
- * in the escrow lifecycle, along with a user-friendly description.
+ * A visual component to display the current status of an escrow agreement
+ * using a clear status badge and a timeline/stepper for the happy path.
+ * Styling is done via TailwindCSS classes.
  */
-const EscrowStatus: React.FC<EscrowStatusProps> = ({ escrow }) => {
-  // The `status` field from the Daml contract payload is a string representation
-  // of the Daml variant (e.g., "Funded"). We use it to look up display details.
-  const statusDetails = statusMap[escrow.status] || defaultStatus;
+export const EscrowStatus: React.FC<EscrowStatusProps> = ({ status }) => {
+  const currentStatusInfo = statusConfig[status];
+  const currentStep = currentStatusInfo.step;
 
-  const cardStyle: React.CSSProperties = {
-    border: `1px solid ${statusDetails.color}`,
-    borderRadius: '8px',
-    padding: '16px',
-    backgroundColor: '#ffffff',
-    boxShadow: '0 2px 4px rgba(0,0,0,0.1)',
-    fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif',
-    maxWidth: '450px',
-    margin: '1rem 0',
+  const isDisputed = status === 'Disputed';
+  const isFinished = ['Completed', 'Refunded', 'ArbitratedRelease', 'ArbitratedRefund'].includes(status);
+  const isHappyPathFinished = status === 'Completed';
+
+  const getStepClass = (stepId: number) => {
+    if (stepId < currentStep || isHappyPathFinished) {
+      return 'bg-indigo-600'; // Completed step
+    }
+    if (stepId === currentStep && !isFinished) {
+      return 'border-2 border-indigo-600'; // Current step
+    }
+    return 'border-2 border-gray-300'; // Future step
   };
 
-  const headerStyle: React.CSSProperties = {
-    margin: '0 0 12px 0',
-    color: '#343a40',
-    fontSize: '1.1rem',
-    fontWeight: 600,
-    borderBottom: '1px solid #dee2e6',
-    paddingBottom: '8px',
+  const getStepTextClass = (stepId: number) => {
+    if (stepId < currentStep || (stepId <= currentStep && isHappyPathFinished)) {
+      return 'text-indigo-600';
+    }
+    return 'text-gray-500';
   };
 
-  const statusBadgeStyle: React.CSSProperties = {
-    display: 'inline-block',
-    padding: '4px 12px',
-    borderRadius: '16px',
-    backgroundColor: statusDetails.backgroundColor,
-    color: statusDetails.color,
-    fontWeight: 'bold',
-    fontSize: '0.9rem',
-    marginBottom: '12px',
-    border: `1px solid ${statusDetails.color}`,
-  };
-
-  const descriptionStyle: React.CSSProperties = {
-    margin: '0',
-    color: '#495057',
-    fontSize: '0.95rem',
-    lineHeight: '1.5',
-  };
+  const getConnectorClass = (stepId: number) => {
+    if (stepId < currentStep || isHappyPathFinished) {
+      return 'bg-indigo-600';
+    }
+    return 'bg-gray-200';
+  }
 
   return (
-    <div style={cardStyle}>
-      <h4 style={headerStyle}>Escrow Status</h4>
-      <div style={statusBadgeStyle}>
-        {statusDetails.text}
+    <div className="p-6 bg-white border border-gray-200 rounded-lg shadow-sm">
+      <h3 className="text-lg font-semibold text-gray-800 mb-4">Escrow Status</h3>
+
+      {/* Main Status Badge */}
+      <div className={`flex items-center p-3 rounded-md mb-8 ${currentStatusInfo.color}`}>
+        <div className="mr-3 text-xl">{currentStatusInfo.icon}</div>
+        <div>
+          <p className="font-bold">{currentStatusInfo.text}</p>
+          <p className="text-sm">{currentStatusInfo.description}</p>
+        </div>
       </div>
-      <p style={descriptionStyle}>
-        {statusDetails.description}
-      </p>
+
+      {/* Timeline/Stepper - not shown for terminal/disputed states */}
+      {!isFinished && !isDisputed && (
+        <div className="px-4 pb-4">
+          <nav aria-label="Progress">
+            <ol role="list" className="flex items-center">
+              {steps.map((step, stepIdx) => (
+                <li key={step.name} className={`relative ${stepIdx !== steps.length - 1 ? 'flex-1' : ''}`}>
+                  <div className="flex items-center">
+                    {/* Circle */}
+                    <div
+                      className={`relative flex h-8 w-8 items-center justify-center rounded-full ${getStepClass(step.id)}`}
+                      style={{ transition: 'background-color 0.3s, border-color 0.3s' }}
+                    >
+                      {step.id < currentStep ? (
+                        <FaCheckCircle className="h-5 w-5 text-white" aria-hidden="true" />
+                      ) : (
+                        <span className="h-2.5 w-2.5 bg-white rounded-full" />
+                      )}
+                    </div>
+                    {/* Connector */}
+                    {stepIdx !== steps.length - 1 && (
+                      <div className={`h-0.5 w-full ${getConnectorClass(step.id + 1)} ml-4`} aria-hidden="true" />
+                    )}
+                  </div>
+                  {/* Label */}
+                  <div className="absolute mt-2 w-max text-center" style={{ left: '50%', transform: 'translateX(-50%)' }}>
+                    <span className={`text-sm font-medium ${getStepTextClass(step.id)}`}>{step.name}</span>
+                  </div>
+                </li>
+              ))}
+            </ol>
+          </nav>
+        </div>
+      )}
     </div>
   );
 };
