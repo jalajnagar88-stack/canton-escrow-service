@@ -1,175 +1,239 @@
--- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
--- SPDX-License-Identifier: Apache-2.0
-
 module EscrowTest where
 
 import Daml.Script
 import DA.Assert
 import DA.Date as Date
-import DA.Time as Time
-import EscrowAccount
-import DeliveryConfirmation
-import DisputeResolution
-import EscrowAgent
+import DA.Time (time)
+import Escrow
+import Arbitration
+import PartialRelease
 
 -- === Test Setup ===
 
-setupParties : Script (Party, Party, Party, Party)
+data Parties = Parties
+  { buyer : Party
+  , seller : Party
+  , agent : Party
+  , arbitrator : Party
+  }
+
+setupParties : Script Parties
 setupParties = do
-  buyer <- allocateParty "Buyer"
-  seller <- allocateParty "Seller"
-  escrowAgent <- allocateParty "EscrowAgent"
-  arbitrator <- allocateParty "Arbitrator"
-  pure (buyer, seller, escrowAgent, arbitrator)
+  buyer <- allocatePartyWithHint "Buyer" (PartyIdHint "buyer")
+  seller <- allocatePartyWithHint "Seller" (PartyIdHint "seller")
+  agent <- allocatePartyWithHint "EscrowAgent" (PartyIdHint "escrow-agent")
+  arbitrator <- allocatePartyWithHint "Arbitrator" (PartyIdHint "arbitrator")
+  return Parties with ..
 
 -- === Test Scenarios ===
 
-escrowTest : Script ()
-escrowTest = script do
-  (buyer, seller, escrowAgent, arbitrator) <- setupParties
+testHappyPathRelease : Script ()
+testHappyPathRelease = script do
+  p <- setupParties
 
-  -- Create the necessary role contracts
-  escrowAgentRoleCid <- submit escrowAgent do
-    createCmd EscrowAgent.Role with agent = escrowAgent
-  arbitratorRoleCid <- submit arbitrator do
-    createCmd DisputeResolution.ArbitratorRole with arbitrator = arbitrator
+  -- 1. Agent creates the escrow agreement, signed by all three parties.
+  let now = time (Date.date 2024 Date.Jan 1) 0 0 0
+  let escrowAmount = 1000.0
+  let agreement = Agreement with
+        buyer = p.buyer
+        seller = p.seller
+        agent = p.agent
+        arbitrator = p.arbitrator
+        amount = escrowAmount
+        description = "Vintage Watch"
+        createdAt = now
+        buyerConfirmed = False
+        sellerConfirmed = False
+        buyerRequestedRefund = False
+        sellerApprovedRefund = False
 
-  -- Run each test scenario
-  testHappyPathRelease buyer seller escrowAgent escrowAgentRoleCid
-  testRefundPath buyer seller escrowAgent escrowAgentRoleCid
-  testDisputeAndArbitration buyer seller escrowAgent arbitrator escrowAgentRoleCid arbitratorRoleCid
+  agreementCid <- submit p.agent do
+    createCmd agreement
 
-  pure ()
+  -- 2. Buyer confirms they have received the goods.
+  agreementCid_BuyerConfirmed <- submit p.buyer do
+    exerciseCmd agreementCid ConfirmDelivery
 
--- Scenario 1: Happy Path - Funds are released to the seller after successful delivery.
-testHappyPathRelease : Party -> Party -> Party -> ContractId EscrowAgent.Role -> Script ()
-testHappyPathRelease buyer seller escrowAgent escrowAgentRoleCid = do
-  debug "--- Running Happy Path Release Test ---"
+  -- Assert that agent cannot release yet, as seller has not confirmed.
+  submitMustFail p.agent do
+    exerciseCmd agreementCid_BuyerConfirmed ReleaseFunds
 
-  let item = "Vintage Watch"
-  let price = 1000.0
-  now <- getTime
-  let deliveryDueDate = Date.addDays (date (Time.toDate now)) 14
+  -- 3. Seller confirms they are satisfied with the buyer's confirmation.
+  agreementCid_SellerConfirmed <- submit p.seller do
+    exerciseCmd agreementCid_BuyerConfirmed ConfirmReceipt
 
-  -- Step 1: Buyer proposes an escrow agreement
-  proposalCid <- submit buyer do
-    createCmd EscrowAccount.Proposal with
-      buyer
-      seller
-      escrowAgent
-      item
-      price
-      deliveryDueDate
+  -- 4. Agent releases the funds to the seller, archiving the agreement.
+  submit p.agent do
+    exerciseCmd agreementCid_SellerConfirmed ReleaseFunds
 
-  -- Step 2: Seller accepts the proposal
-  setupCid <- submit seller do
-    exerciseCmd proposalCid EscrowAccount.Proposal_Accept
-
-  -- Step 3: Escrow agent accepts and confirms funding
-  fundedCid <- submit escrowAgent do
-    exerciseCmd setupCid EscrowAccount.Setup_AcceptAndFund
-
-  -- Step 4: Seller initiates delivery
-  deliveryPendingCid <- submit seller do
-    exerciseCmd fundedCid EscrowAccount.InitiateDelivery
-
-  -- Step 5: Buyer confirms receipt of the goods
-  -- This choice archives the DeliveryConfirmation.Pending contract and exercises
-  -- MarkAsDeliverable on the EscrowAccount.Funded contract.
-  (archivedDelivery, releasedEscrowCid) <- submit buyer do
-    exerciseCmd deliveryPendingCid DeliveryConfirmation.Pending_ConfirmDelivery
-
-  -- Step 6: Escrow agent releases the funds to the seller
-  closedCid <- submit escrowAgent do
-    exerciseCmd releasedEscrowCid EscrowAccount.ReleaseFunds
-
-  -- Final assertion: Verify the account is closed with 'Released' status
-  closedContract <- fetch closedCid
-  assertMsg "Escrow account should be closed with status Released" (closedContract.status == Released)
-  debug "--- Happy Path Release Test Successful ---"
+  -- 5. Verify the agreement is archived.
+  agreements <- query @Agreement p.agent
+  assert (null agreements)
+  return ()
 
 
--- Scenario 2: Refund Path - Funds are returned to the buyer.
-testRefundPath : Party -> Party -> Party -> ContractId EscrowAgent.Role -> Script ()
-testRefundPath buyer seller escrowAgent escrowAgentRoleCid = do
-  debug "--- Running Refund Path Test ---"
+testAgreedRefund : Script ()
+testAgreedRefund = script do
+  p <- setupParties
 
-  let item = "Custom Artwork"
-  let price = 500.0
-  now <- getTime
-  let deliveryDueDate = Date.addDays (date (Time.toDate now)) 30
+  -- 1. Agent creates the escrow agreement.
+  let now = time (Date.date 2024 Date.Feb 15) 0 0 0
+  let escrowAmount = 500.0
+  let agreement = Agreement with
+        buyer = p.buyer
+        seller = p.seller
+        agent = p.agent
+        arbitrator = p.arbitrator
+        amount = escrowAmount
+        description = "Custom Software Module"
+        createdAt = now
+        buyerConfirmed = False
+        sellerConfirmed = False
+        buyerRequestedRefund = False
+        sellerApprovedRefund = False
 
-  -- Steps 1-3: Propose, accept, and fund the escrow account
-  proposalCid <- submit buyer do
-    createCmd EscrowAccount.Proposal with buyer, seller, escrowAgent, item, price, deliveryDueDate
-  setupCid <- submit seller do
-    exerciseCmd proposalCid EscrowAccount.Proposal_Accept
-  fundedCid <- submit escrowAgent do
-    exerciseCmd setupCid EscrowAccount.Setup_AcceptAndFund
+  agreementCid <- submit p.agent do
+    createCmd agreement
 
-  -- Step 4: Buyer requests a refund (e.g., seller is unresponsive)
-  refundRequestCid <- submit buyer do
-    exerciseCmd fundedCid EscrowAccount.RequestRefund with reason = "Seller did not ship the item."
+  -- 2. Buyer requests a refund (e.g., they changed their mind).
+  agreementCid_RefundRequested <- submit p.buyer do
+    exerciseCmd agreementCid RequestRefund
 
-  -- Step 5: Seller agrees to the refund
-  -- This archives the RefundRequest and exercises MarkAsRefundable on the Funded contract.
-  (archivedRequest, refundableEscrowCid) <- submit seller do
-    exerciseCmd refundRequestCid EscrowAccount.RefundRequest_ApproveRefund
+  -- Assert that agent cannot refund yet, as seller has not approved.
+  submitMustFail p.agent do
+    exerciseCmd agreementCid_RefundRequested RefundFunds
 
-  -- Step 6: Escrow agent processes the refund to the buyer
-  closedCid <- submit escrowAgent do
-    exerciseCmd refundableEscrowCid EscrowAccount.RefundFunds
+  -- 3. Seller agrees to the refund.
+  agreementCid_RefundApproved <- submit p.seller do
+    exerciseCmd agreementCid_RefundRequested ApproveRefund
 
-  -- Final assertion: Verify the account is closed with 'Refunded' status
-  closedContract <- fetch closedCid
-  assertMsg "Escrow account should be closed with status Refunded" (closedContract.status == Refunded)
-  debug "--- Refund Path Test Successful ---"
+  -- 4. Agent processes the refund to the buyer.
+  submit p.agent do
+    exerciseCmd agreementCid_RefundApproved RefundFunds
+
+  -- 5. Verify the agreement is archived.
+  agreements <- query @Agreement p.agent
+  assert (null agreements)
+  return ()
+
+testDisputeAndArbitration : Script ()
+testDisputeAndArbitration = script do
+  p <- setupParties
+
+  -- 1. Agent creates the escrow agreement.
+  let now = time (Date.date 2024 Mar 10) 0 0 0
+  let escrowAmount = 2500.0
+  let agreement = Agreement with
+        buyer = p.buyer
+        seller = p.seller
+        agent = p.agent
+        arbitrator = p.arbitrator
+        amount = escrowAmount
+        description = "Graphic Design Services"
+        createdAt = now
+        buyerConfirmed = False
+        sellerConfirmed = False
+        buyerRequestedRefund = False
+        sellerApprovedRefund = False
+
+  agreementCid <- submit p.agent do
+    createCmd agreement
+
+  -- 2. Buyer raises a dispute, claiming the work is not as described.
+  let disputeReason = "The delivered design assets do not meet the specifications outlined in the brief."
+  disputeCid <- submit p.buyer do
+    exerciseCmd agreementCid (RaiseDispute with reason = disputeReason)
+
+  -- 3. Agent reviews the dispute and escalates it to the designated arbitrator.
+  let escalationNotes = "Initial mediation failed. Buyer and seller cannot agree. Escalating for binding arbitration."
+  caseCid <- submit p.agent do
+    exerciseCmd disputeCid (EscalateToArbitration with notes = escalationNotes)
+
+  -- 4. Arbitrator reviews the case and makes a ruling.
+  -- In this scenario, the arbitrator finds fault on both sides and decides on a partial release.
+  -- Seller gets 60% for work done, Buyer gets 40% back.
+  let buyerPayout = 0.4 * escrowAmount
+  let sellerPayout = 0.6 * escrowAmount
+  let partialRelease = Split with buyerAmount = buyerPayout, sellerAmount = sellerPayout
+  let rulingReason = "Seller provided a significant portion of the agreed work but failed on key specifications. Buyer was not clear in their revision requests. A 60/40 split is deemed equitable."
+
+  assertMsg "Payouts must sum to total escrow amount" (buyerPayout + sellerPayout == escrowAmount)
+
+  rulingCid <- submit p.arbitrator do
+    exerciseCmd caseCid (Rule with ruling = partialRelease, reason = rulingReason)
+
+  -- 5. Agent executes the ruling from the arbitrator.
+  submit p.agent do
+    exerciseCmd rulingCid ExecuteRuling
+
+  -- 6. Verify all contracts (Agreement, Dispute, Case, Ruling) are archived.
+  agreements <- query @Agreement p.agent
+  assert (null agreements)
+  disputes <- query @Dispute p.agent
+  assert (null disputes)
+  cases <- query @Case p.agent
+  assert (null cases)
+  rulings <- query @Ruling p.agent
+  assert (null rulings)
+
+  return ()
+
+testDisputeSellerInitiated : Script ()
+testDisputeSellerInitiated = script do
+  p <- setupParties
+
+  -- 1. Agent creates the escrow agreement.
+  let now = time (Date.date 2024 Apr 1) 0 0 0
+  let escrowAmount = 750.0
+  let agreement = Agreement with
+        buyer = p.buyer
+        seller = p.seller
+        agent = p.agent
+        arbitrator = p.arbitrator
+        amount = escrowAmount
+        description = "Handmade Furniture"
+        createdAt = now
+        buyerConfirmed = False
+        sellerConfirmed = False
+        buyerRequestedRefund = False
+        sellerApprovedRefund = False
+
+  agreementCid <- submit p.agent do
+    createCmd agreement
+
+  -- 2. Seller claims they have delivered but buyer is unresponsive and won't confirm.
+  let disputeReason = "Goods were delivered and signed for on March 28th, but the buyer has not confirmed receipt on the platform and is not responding to messages."
+  disputeCid <- submit p.seller do
+    exerciseCmd agreementCid (RaiseDispute with reason = disputeReason)
+
+  -- 3. Agent escalates to arbitration.
+  let escalationNotes = "Seller provided proof of delivery. Buyer is unresponsive."
+  caseCid <- submit p.agent do
+    exerciseCmd disputeCid (EscalateToArbitration with notes = escalationNotes)
+
+  -- 4. Arbitrator reviews evidence and rules in favor of the seller.
+  let partialRelease = Split with buyerAmount = 0.0, sellerAmount = escrowAmount
+  let rulingReason = "Seller has provided a valid proof of delivery document signed by the buyer. Buyer has not responded to inquiries from the agent or arbitrator. Full release to seller is warranted."
+
+  rulingCid <- submit p.arbitrator do
+    exerciseCmd caseCid (Rule with ruling = partialRelease, reason = rulingReason)
+
+  -- 5. Agent executes the full release to the seller.
+  submit p.agent do
+    exerciseCmd rulingCid ExecuteRuling
+
+  -- 6. Verify contracts are archived.
+  agreements <- query @Agreement p.agent
+  assert (null agreements)
+
+  return ()
 
 
--- Scenario 3: Dispute and Arbitration Path
-testDisputeAndArbitration :
-  Party -> Party -> Party -> Party -> ContractId EscrowAgent.Role -> ContractId DisputeResolution.ArbitratorRole -> Script ()
-testDisputeAndArbitration buyer seller escrowAgent arbitrator escrowAgentRoleCid arbitratorRoleCid = do
-  debug "--- Running Dispute and Arbitration Test ---"
+-- === Test Suite ===
 
-  let item = "Antique Vase"
-  let price = 2500.0
-  now <- getTime
-  let deliveryDueDate = Date.addDays (date (Time.toDate now)) 7
-
-  -- Steps 1-4: Propose, accept, fund, and deliver
-  proposalCid <- submit buyer do
-    createCmd EscrowAccount.Proposal with buyer, seller, escrowAgent, item, price, deliveryDueDate
-  setupCid <- submit seller do
-    exerciseCmd proposalCid EscrowAccount.Proposal_Accept
-  fundedCid <- submit escrowAgent do
-    exerciseCmd setupCid EscrowAccount.Setup_AcceptAndFund
-  deliveryPendingCid <- submit seller do
-    exerciseCmd fundedCid EscrowAccount.InitiateDelivery
-
-  -- Step 5: Buyer disputes the delivery (e.g., item is not as described)
-  -- This creates a DisputeResolution.Pending contract.
-  disputePendingCid <- submit buyer do
-    exerciseCmd deliveryPendingCid DeliveryConfirmation.Pending_DisputeDelivery with
-      reason = "The vase arrived with a large crack."
-
-  -- Step 6: Escrow agent escalates the dispute to a neutral arbitrator
-  arbitratingCid <- submit escrowAgent do
-    exerciseCmd disputePendingCid DisputeResolution.Pending_EscalateToArbitrator with
-      arbitrator
-      arbitratorRoleCid
-
-  -- Step 7: Arbitrator reviews the case and rules in favor of the buyer
-  -- This choice archives the Arbitrating contract and exercises MarkAsRefundable on the Funded contract.
-  (archivedArbitration, refundableEscrowCid) <- submit arbitrator do
-    exerciseCmd arbitratingCid DisputeResolution.Arbitrating_RuleInFavorOfBuyer with
-      ruling = "Evidence confirms the item was damaged. A full refund is warranted."
-
-  -- Step 8: Escrow agent processes the refund based on the arbitrator's ruling
-  closedCid <- submit escrowAgent do
-    exerciseCmd refundableEscrowCid EscrowAccount.RefundFunds
-
-  -- Final assertion: Verify the account is closed with 'Refunded' status after arbitration
-  closedContract <- fetch closedCid
-  assertMsg "Escrow account should be closed with status Refunded after arbitration" (closedContract.status == Refunded)
-  debug "--- Dispute and Arbitration Test Successful ---"
+escrowTests : Script ()
+escrowTests = do
+  test "HappyPathRelease" "Full release after both parties confirm" testHappyPathRelease
+  test "AgreedRefund" "Full refund after both parties agree" testAgreedRefund
+  test "DisputeAndArbitration" "A disputed transaction is settled via partial release by an arbitrator" testDisputeAndArbitration
+  test "DisputeSellerInitiated" "Seller initiates a dispute and wins arbitration" testDisputeSellerInitiated
