@@ -1,53 +1,87 @@
--- | This module defines the data type and validation logic for handling partial
--- | releases of funds from an escrow contract. This is essential for use cases
--- | involving milestone-based payments or phased deliveries.
-module Escrow.PartialRelease where
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
 
--- | Represents an instruction to perform a partial release of funds from an escrow account.
--- This is typically used for milestone-based payments where parts of the total amount
--- are released as project phases are completed. The instruction must specify both the
--- amount to release and the amount that will remain, ensuring the total is conserved.
-data PartialRelease = PartialRelease
+module PartialRelease where
+
+import DA.Assert ((assertMsg))
+import Daml.Script (Script)
+
+-- The main Escrow contract is defined in a separate module. We assume it
+-- provides a choice `ProcessPartialRelease` that the agent can exercise.
+import Escrow.Contract (Escrow)
+
+-- | A proposal from the Seller to the Buyer to release a portion of the
+-- | escrowed funds. This is typically used for milestone-based payments where
+-- | the total escrowed amount is disbursed in stages.
+template PartialReleaseProposal
   with
-    releaseAmount : Decimal
-      -- ^ The amount of funds to be released to the seller in this partial payment.
-      -- This value must be greater than zero.
-    remainingAmount : Decimal
-      -- ^ The amount of funds that will remain in escrow after this release.
-      -- This value must be zero or greater.
-    reason : Text
-      -- ^ A description of the milestone or reason for this partial release. This provides
-      -- an auditable record of why funds were released.
-  deriving (Eq, Show)
+    escrowCid     : ContractId Escrow -- ^ The main escrow contract to which this release applies.
+    proposer      : Party            -- ^ The party proposing the release (usually the Seller).
+    approver      : Party            -- ^ The party who must approve the release (usually the Buyer).
+    agent         : Party            -- ^ The escrow agent overseeing the transaction.
+    releaseAmount : Decimal          -- ^ The amount of funds to be released.
+    reason        : Text             -- ^ A description for this release, e.g., "Milestone 1 Complete".
+  where
+    signatory proposer
+    observer approver, agent
 
--- | Validates a `PartialRelease` instruction against the total amount currently held in escrow.
--- It ensures that the proposed release is financially sound and consistent with the state
--- of the escrow contract.
---
--- Returns `Right ()` on successful validation, or `Left errorMsg` on failure.
---
--- The validation checks are:
--- 1. The `releaseAmount` must be a positive number.
--- 2. The `remainingAmount` must be non-negative.
--- 3. The sum of `releaseAmount` and `remainingAmount` must exactly equal the
---    `totalEscrowedAmount`. This prevents accidental creation or destruction of value.
-validatePartialRelease
-  : Decimal       -- ^ The total amount currently held in the escrow contract.
-  -> PartialRelease -- ^ The partial release instruction to validate.
-  -> Either Text () -- ^ The result of the validation.
-validatePartialRelease totalEscrowedAmount release =
-  let
-    totalFromRelease = release.releaseAmount + release.remainingAmount
-    errorPrefix = "Partial release validation failed: "
-  in if
-    | release.releaseAmount <= 0.0 ->
-        Left $ errorPrefix <> "Release amount must be positive, but got " <> show release.releaseAmount <> "."
-    | release.remainingAmount < 0.0 ->
-        Left $ errorPrefix <> "Remaining amount cannot be negative, but got " <> show release.remainingAmount <> "."
-    | totalFromRelease /= totalEscrowedAmount ->
-        Left $ errorPrefix <> "The sum of the release amount (" <> show release.releaseAmount <>
-               ") and remaining amount (" <> show release.remainingAmount <>
-               ") is " <> show totalFromRelease <> ", which does not match the total escrowed amount of " <>
-               show totalEscrowedAmount <> "."
-    | otherwise ->
-        Right ()
+    ensure
+      releaseAmount > 0.0
+
+    key (proposer, approver, escrowCid) : (Party, Party, ContractId Escrow)
+    maintainer key._1
+
+    choice Withdraw_PartialReleaseProposal : ()
+      -- | The proposer (Seller) can withdraw the proposal before it is accepted.
+      controller proposer
+      do
+        pure ()
+
+    choice Reject_PartialReleaseProposal : ()
+      -- | The approver (Buyer) can reject the proposal.
+      controller approver
+      do
+        pure ()
+
+    choice Accept_PartialReleaseProposal : ContractId PartialReleaseAgreement
+      -- | The approver (Buyer) accepts the proposal, creating a binding agreement
+      -- | that the agent can then execute.
+      controller approver
+      do
+        create PartialReleaseAgreement with
+          escrowCid
+          proposer
+          approver
+          agent
+          releaseAmount
+          reason
+
+-- | A binding agreement between the Buyer and Seller to release a specific
+-- | amount of funds. This contract authorizes the Escrow Agent to execute
+-- | the payment from the main escrow contract. It is created when the Buyer
+-- | accepts a `PartialReleaseProposal`.
+template PartialReleaseAgreement
+  with
+    escrowCid     : ContractId Escrow -- ^ The main escrow contract.
+    proposer      : Party            -- ^ The party who proposed the release (Seller).
+    approver      : Party            -- ^ The party who approved the release (Buyer).
+    agent         : Party            -- ^ The escrow agent.
+    releaseAmount : Decimal          -- ^ The agreed-upon amount to release.
+    reason        : Text             -- ^ The reason for the release.
+  where
+    signatory proposer, approver
+    observer agent
+
+    key (proposer, approver, escrowCid) : (Party, Party, ContractId Escrow)
+    maintainer key._1
+
+    choice Execute_PartialRelease : ContractId Escrow
+      -- | The Escrow Agent executes the partial release against the main
+      -- | Escrow contract. This archives the agreement and returns the
+      -- | CID of the updated Escrow contract with a reduced balance.
+      controller agent
+      do
+        -- Exercise the choice on the main Escrow contract to process the payment.
+        -- This choice is expected to reduce the escrowed amount and handle the
+        -- transfer logic, returning the CID of the updated Escrow contract.
+        exercise escrowCid ProcessPartialRelease with amountToRelease = releaseAmount
