@@ -2,188 +2,126 @@
 
 [![CI](https://github.com/digital-asset/canton-escrow-service/actions/workflows/ci.yml/badge.svg)](https://github.com/digital-asset/canton-escrow-service/actions/workflows/ci.yml)
 
-A secure, private, multi-party escrow service for on-chain commerce, built with Daml smart contracts for the Canton Network.
+A multi-party escrow service for secure commerce, built on the Canton Network. This project provides a set of Daml smart contracts to facilitate trustless transactions between buyers and sellers, mediated by a neutral escrow agent.
+
+It is designed for integration into digital marketplaces, e-commerce platforms, and peer-to-peer service agreements where payment security is critical.
 
 ## Overview
 
-This project provides a robust and secure escrow service that enables safe transactions between two parties (a buyer and a seller) by holding funds with a neutral third-party escrow agent until predefined conditions are met.
+In many online transactions, there's a risk for both the buyer (not receiving goods after payment) and the seller (not being paid after delivery). Traditional escrow services are centralized, slow, and often expensive.
 
-Leveraging Canton's privacy model, the details of each escrow agreement are only visible to the involved parties (Buyer, Seller, and Escrow Agent), ensuring commercial confidentiality. Daml's atomic transaction guarantees ensure that all steps of the escrow process, such as payment release and contract archival, happen simultaneously or not at all, eliminating settlement risk.
+This project leverages the privacy and atomicity guarantees of the Canton Network to provide a transparent, efficient, and secure on-ledger escrow solution.
 
-### Features
+-   **Buyer** deposits funds into the escrow contract.
+-   **Seller** delivers the goods or services.
+-   **Both parties** confirm the state of the transaction.
+-   A neutral **Escrow Agent** oversees the process and releases funds or handles disputes according to the agreed-upon rules encoded in the smart contract.
 
--   **Multi-Party Agreement:** Requires explicit agreement from Buyer, Seller, and Escrow Agent to establish the contract.
--   **Secure Fund Holding:** Funds are locked in the contract until conditions for release or refund are met.
--   **Conditional Release:** Payment is released to the Seller only after the Buyer confirms delivery.
--   **Built-in Dispute Resolution:** A clear mechanism for the Escrow Agent to mediate and resolve disputes.
--   **Private by Design:** Contract details are kept confidential to the stakeholders.
--   **Atomic Settlement:** Canton guarantees that complex multi-step actions are always all-or-nothing.
+## Features
+
+-   **Atomic DvP**: Funds are locked simultaneously with the creation of the escrow agreement, ensuring the seller that the buyer has sufficient funds.
+-   **Mutual Confirmation**: Funds are only released to the seller after both the buyer and seller confirm successful delivery.
+-   **Secure Refund**: Funds are returned to the buyer if both parties agree to cancel the transaction.
+-   **Dispute Resolution**: A formal process to raise and resolve disputes, with the Escrow Agent acting as a mediator or escalating to a designated arbitrator.
+-   **Partial Release**: Supports complex agreements where partial payments can be released upon meeting specific milestones. See `daml/PartialRelease.daml`.
+-   **Privacy**: Transaction details are only visible to the involved parties (Buyer, Seller, Escrow Agent), as is standard on Canton.
 
 ## Escrow Workflow
 
-The core workflow is designed to be simple and secure. For detailed sequence diagrams, see [`docs/ESCROW_FLOWS.md`](./docs/ESCROW_FLOWS.md).
+The lifecycle of an escrow agreement follows these steps:
 
-1.  **Request:** A Buyer or Seller initiates an `EscrowRequest`, detailing the terms, price, and designated Escrow Agent.
-2.  **Agreement:** All three parties (Buyer, Seller, Agent) must agree to the terms to create the active `EscrowContract`.
-3.  **Deposit:** The Buyer deposits the required funds into the contract. (Note: This typically involves an atomic Delivery-vs-Payment (DVP) with a Canton-native token).
-4.  **Delivery:** The Seller provides the goods or services as agreed.
-5.  **Confirmation:** The Buyer confirms satisfactory delivery.
-6.  **Resolution:**
-    -   **Happy Path:** Upon confirmation, the Escrow Agent releases the funds to the Seller.
-    -   **Dispute:** If there's a disagreement, either party can initiate a dispute. The Escrow Agent then investigates and resolves the dispute by either releasing funds to the Seller or refunding them to the Buyer.
+1.  **Agreement & Funding**: The Buyer and Seller agree on the terms (price, item description). An `EscrowAgreement` proposal is created by one party and accepted by the other. The Buyer's funds are concurrently locked into the contract.
+2.  **Delivery**: The Seller delivers the goods or services as per the agreement.
+3.  **Confirmation**:
+    -   The Seller confirms that delivery is complete by exercising the `ConfirmDelivery` choice.
+    -   The Buyer confirms receipt and satisfaction by exercising the `ConfirmReceipt` choice.
+4.  **Resolution**:
+    -   **Happy Path (Release)**: Once both parties have confirmed, the Escrow Agent is authorized to release the funds to the Seller by exercising the `ReleaseFunds` choice.
+    -   **Happy Path (Refund)**: If the deal is cancelled, both parties can agree to a refund. The Escrow Agent exercises `RefundBuyer` to return the funds.
+    -   **Dispute Path**: If there is a disagreement, either party can exercise `RaiseDispute`. This archives the main agreement and creates a `Dispute` contract, freezing the funds until the Escrow Agent or an arbitrator resolves it.
 
-## Getting Started
+For a detailed breakdown of the flows, see [docs/ESCROW_FLOWS.md](./docs/ESCROW_FLOWS.md).
+
+## Getting Started (Local Development)
 
 ### Prerequisites
 
--   [DPM (Daml Package Manager) v3.4.0 or later](https://docs.digitalasset.com/dpm/getting-started/install-sdk)
--   [Node.js v18+](https://nodejs.org/) and npm
+-   [DPM (Digital Asset Package Manager)](https://docs.digitalasset.com/dpm/getting-started.html#install-dpm) for the Canton SDK.
 
-### Local Development
+### Setup
 
 1.  **Clone the repository:**
     ```bash
-    git clone https://github.com/digital-asset/canton-escrow-service.git
+    git clone https://github.com/your-org/canton-escrow-service.git
     cd canton-escrow-service
     ```
 
 2.  **Build the Daml models:**
-    This command compiles the Daml code into a DAR (Daml Archive) file.
+    This command compiles the Daml code into a DAR (Daml Archive).
     ```bash
     dpm build
     ```
 
-3.  **Start a local Canton ledger:**
-    This command starts a sandbox Canton environment and exposes the JSON API on port 7575.
+3.  **Run the tests:**
+    This executes the Daml Script tests defined in the `daml/Test` directory.
+    ```bash
+    dpm test
+    ```
+
+4.  **Start a local Canton ledger:**
+    This command starts a single-node Canton instance (a "sandbox") with the JSON API enabled on port 7575.
     ```bash
     dpm sandbox
     ```
 
-4.  **Install frontend dependencies and run the UI:**
-    In a new terminal:
+5.  **Run the frontend (optional):**
+    The React-based frontend provides a simple interface for interacting with the contracts.
     ```bash
     cd frontend
     npm install
     npm start
     ```
-    The sample UI will be available at `http://localhost:3000`.
 
-## Integration via JSON API
+## Integration for Platforms
 
-You can integrate the escrow service into any application using the Canton Participant's JSON API. A JWT token for a specific party is required in the `Authorization: Bearer <token>` header for all requests.
+Marketplaces and commerce platforms can integrate this escrow service via the Canton Ledger API.
 
-The included TypeScript client in [`frontend/src/escrowService.ts`](./frontend/src/escrowService.ts) provides a reference implementation.
+### High-Level Steps
 
-#### 1. Create an Escrow Request
+1.  **Party Management**:
+    -   Allocate a unique `Party` on the Canton ledger for each user (buyer, seller) and for your platform (as the Escrow Agent). This is typically done via the JSON API's `/v2/parties/allocate` endpoint.
+    -   Store the mapping between your platform's user IDs and their Canton `Party` ID.
 
-`POST /v1/create`
+2.  **Initiate Escrow**:
+    -   When a transaction occurs on your platform, construct and submit a `create` command for the `Escrow.EscrowAgreement` template.
+    -   The command must be submitted by the `buyer`, who will be the signatory on the contract and whose funds will be locked.
+    -   The payload will include the `buyer`, `seller`, `escrowAgent`, the amount, and a description of the item/service.
 
-```json
-{
-  "templateId": "Escrow.Request:EscrowRequest",
-  "payload": {
-    "buyer": "BuyerPartyId::...",
-    "seller": "SellerPartyId::...",
-    "agent": "AgentPartyId::...",
-    "price": "1000.00",
-    "description": "Custom Web Design Services",
-    "currency": "USD",
-    "requester": "BuyerPartyId::..."
-  }
-}
-```
+3.  **Monitor Contract State**:
+    -   Your application backend should use the JSON API's stream endpoints (`/v2/state/active-contracts` or `/v2/events/transactions`) to monitor the state of escrow contracts relevant to your users.
+    -   Your UI can then reflect the current status (e.g., "Awaiting Delivery," "Funds in Escrow," "Dispute Raised").
 
-#### 2. Accept the Request (by a counterparty)
-
-`POST /v1/exercise`
-
-```json
-{
-  "templateId": "Escrow.Request:EscrowRequest",
-  "contractId": "00...",
-  "choice": "Accept",
-  "argument": {}
-}
-```
-*Note: The Agent must also accept to create the final `EscrowContract`.*
-
-#### 3. Deposit Funds (by Buyer)
-
-`POST /v1/exercise`
-
-```json
-{
-  "templateId": "Escrow.Contract:EscrowContract",
-  "contractId": "00...",
-  "choice": "Deposit",
-  "argument": {
-    "paymentCid": "some-fungible-token-contract-id"
-  }
-}
-```
-
-#### 4. Confirm Delivery (by Buyer)
-
-`POST /v1/exercise`
-
-```json
-{
-  "templateId": "Escrow.Contract:EscrowContract",
-  "contractId": "00...",
-  "choice": "ConfirmDelivery",
-  "argument": {}
-}
-```
-
-#### 5. Release Payment (by Agent)
-
-`POST /v1/exercise`
-
-```json
-{
-  "templateId": "Escrow.Contract:EscrowContract",
-  "contractId": "00...",
-  "choice": "ReleasePayment",
-  "argument": {}
-}
-```
+4.  **Exercise Choices**:
+    -   When a user takes an action on your platform (e.g., clicks "I have received the item"), your backend translates this into an `exercise` command on the corresponding contract.
+    -   For example, a buyer's confirmation would trigger an exercise of the `ConfirmReceipt` choice on the `EscrowAgreement` contract, using the buyer's `Party` token for authorization.
 
 ## Project Structure
 
 ```
 .
-├── daml                   # Daml source code
-│   └── Escrow
-│       ├── Contract.daml  # Main escrow contract
-│       ├── Dispute.daml   # Dispute resolution logic
-│       └── Request.daml   # Initial request/proposal
-├── frontend               # React UI for demonstration
-│   ├── src
-│   │   ├── App.tsx
-│   │   └── escrowService.ts # TypeScript client for JSON API
-│   └── package.json
-├── docs
-│   └── ESCROW_FLOWS.md    # Sequence diagrams
-├── tests                  # Daml Script tests
-│   └── EscrowTests.daml
-├── .github/workflows
-│   └── ci.yml             # GitHub Actions CI
-├── daml.yaml              # Daml project configuration
-└── README.md
-```
-
-## Testing
-
-Run the Daml Script tests to verify the contract logic on an isolated, in-memory ledger:
-
-```bash
-dpm test
+├── .github/workflows/      # GitHub Actions CI configuration
+├── daml/
+│   ├── Escrow.daml         # Main escrow agreement and lifecycle logic
+│   ├── PartialRelease.daml # Logic for milestone-based partial releases
+│   ├── Dispute.daml        # Dispute resolution contracts
+│   └── Test/               # Daml Script tests
+├── docs/
+│   └── ESCROW_FLOWS.md     # Detailed sequence diagrams of user flows
+├── frontend/               # Example React frontend application
+├── daml.yaml               # Daml package configuration
+└── README.md               # This file
 ```
 
 ## Contributing
 
-Contributions are welcome! Please open an issue to discuss your ideas or submit a pull request with your changes.
-
-## License
-
-This project is licensed under the [Apache 2.0 License](./LICENSE).
+Contributions are welcome! Please feel free to open a pull request or submit an issue. For major changes, please open an issue first to discuss what you would like to change.
